@@ -1,0 +1,938 @@
+/*** ================================================================
+ *  AKRUB SALE REPORT AUTOMATION
+ *
+ *  1) Items Column  ->  Short Name (with auto-generation) – plain text
+ *  2) Item Quantity Column ->  per-item quantities, comma separated
+ *  3) Total Quantity Column ->  summation of those quantities
+ *  4) Telegram Dispatch - Dynamic Bot Token & Chat IDs per contact
+ *  ================================================================ */
+
+// ---- Sheet / header names ----------------------------------------
+const SALES_SHEET_NAME    = 'Total Sales';
+const LOOKUP_SHEET_NAME   = 'Product Short Name';
+const TELEGRAM_SHEET_NAME = 'Telegram';
+const ITEMS_HEADER        = 'Items';
+const ITEM_QUANTITY_HEADER = 'Item Quantity';
+const TOTAL_QUANTITY_HEADER = 'Total Quantity';
+const LOOKUP_NAME_HEADER  = 'Product Name';
+const LOOKUP_SHORT_HEADER = 'Short Name';
+
+const MATCH_THRESHOLD = 0.6;
+const WRITE_GUARD_KEY = 'ITEMS_CONVERTING';
+const PROCESSING_DELAY = 3000;
+const BATCH_ITEM_DELAY = 500;
+
+// ---- DEFAULT COLORS ----
+const DEFAULT_FONT_COLOR = '#000000';
+const DEFAULT_BG_COLOR   = '#ffffff';   // kept for lookup sheet only
+
+/* ================================================================
+ *  COLOR MAPPING (for font color only)
+ * ================================================================ */
+
+const COLOR_MAP = {
+  'black':   { font: '#000000' },
+  'white':   { font: '#ffffff' },
+  'emerald': { font: '#00897b' },
+  'forest':  { font: '#1b5e20' },
+  'green':   { font: '#2e7d32' },
+  'red':     { font: '#c62828' },
+  'blue':    { font: '#1565c0' },
+  'yellow':  { font: '#f9a825' },
+  'golden':  { font: '#f57f17' },
+  'gold':    { font: '#f57f17' },
+  'brown':   { font: '#4e342e' },
+  'grey':    { font: '#757575' },
+  'gray':    { font: '#757575' },
+  'pink':    { font: '#c2185b' },
+  'purple':  { font: '#7b1fa2' },
+  'orange':  { font: '#e65100' }
+};
+
+/**
+ * Returns the font color based on the text content.
+ * If a known color word is found, returns that color; otherwise returns default black.
+ */
+function getFontColorForText(text) {
+  const lower = String(text || '').toLowerCase();
+  for (const key in COLOR_MAP) {
+    if (lower.indexOf(key) !== -1) {
+      return COLOR_MAP[key].font;
+    }
+  }
+  return DEFAULT_FONT_COLOR;
+}
+
+/* ================================================================
+ *  SHORT NAME GENERATION & LOOKUP
+ * ================================================================ */
+
+function generateShortName(productName, existingShortNames) {
+  let str = String(productName).trim();
+  let material = '';
+  if (str.toLowerCase().includes('marble')) material = 'M';
+  else if (str.toLowerCase().includes('granite')) material = 'G';
+  else if (str.toLowerCase().includes('natural')) material = 'M';
+  else material = 'P';
+  
+  let base = 'Piri';
+  if (str.includes('/') && str.toLowerCase().includes('chakla')) {
+    base = 'Piri-Chakla';
+  } else if (str.toLowerCase().includes('chakla') && !str.toLowerCase().includes('piri')) {
+    base = 'Chakla';
+  }
+  
+  let color = '';
+  const colors = ['Black', 'White', 'Green', 'Red', 'Blue', 'Yellow', 'Golden', 'Emerald', 'Brown', 'Grey'];
+  for (const c of colors) {
+    if (str.toLowerCase().includes(c.toLowerCase())) {
+      color = c;
+      break;
+    }
+  }
+  if (!color) color = 'Unknown';
+  
+  let shape = '';
+  const shapes = ['Round', 'Octagon', 'Square', 'Rectangle', 'Oval', 'Hexagon'];
+  for (const s of shapes) {
+    if (str.toLowerCase().includes(s.toLowerCase())) {
+      shape = s;
+      break;
+    }
+  }
+  if (!shape) shape = 'Shape';
+  
+  let shortName = material + '-' + base + '-' + color + '-' + shape;
+  shortName = shortName.replace(/\s+/g, '-');
+  shortName = shortName.replace(/[^a-zA-Z0-9\-]/g, '');
+  
+  let uniqueName = shortName;
+  let counter = 1;
+  while (existingShortNames && existingShortNames.includes(uniqueName)) {
+    uniqueName = shortName + '-' + counter;
+    counter++;
+  }
+  return uniqueName;
+}
+
+function addToLookupSheet(productName, shortName) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const lookupSheet = ss.getSheetByName(LOOKUP_SHEET_NAME);
+  if (!lookupSheet) {
+    console.error('Lookup sheet not found');
+    return null;
+  }
+  const lastRow = lookupSheet.getLastRow();
+  lookupSheet.getRange(lastRow + 1, 1).setValue(productName);
+  lookupSheet.getRange(lastRow + 1, 2).setValue(shortName);
+  // Apply font color based on the short name (for visual reference in lookup sheet)
+  const fontColor = getFontColorForText(shortName);
+  const newCell = lookupSheet.getRange(lastRow + 1, 2);
+  newCell.setFontColor(fontColor);
+  // Do not set background – leave it as default
+  SpreadsheetApp.flush();
+  Logger.log('Added new product to lookup: "' + productName + '" -> "' + shortName + '"');
+  return { row: lastRow + 1, shortName: shortName };
+}
+
+/* ================================================================
+ *  QUANTITY EXTRACTION & SUMMARIZATION
+ * ================================================================ */
+
+function extractNumericQuantity(quantityStr) {
+  if (!quantityStr || quantityStr === '') return '';
+  const match = quantityStr.match(/\d+/);
+  if (match) return parseInt(match[0], 10);
+  return '';
+}
+
+function summarizeQuantities_(qtyArray) {
+  const arr = qtyArray || [];
+  if (arr.length === 0) return { list: '', total: '' };
+  const nums = arr.map(q => {
+    const n = parseInt(q, 10);
+    return isNaN(n) ? 1 : n;
+  });
+  const list = nums.join(', ');
+  const total = nums.reduce((a, b) => a + b, 0);
+  return { list: list, total: total };
+}
+
+/* ================================================================
+ *  DYNAMIC TELEGRAM CONFIGURATION (unchanged)
+ * ================================================================ */
+
+function getTelegramConfigByName(name) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const tgSheet = ss.getSheetByName(TELEGRAM_SHEET_NAME);
+  if (!tgSheet) {
+    console.error('Telegram sheet not found');
+    return null;
+  }
+  const data = tgSheet.getDataRange().getValues();
+  if (data.length < 2) {
+    console.error('Telegram sheet has no data');
+    return null;
+  }
+  for (let i = 0; i < data.length; i++) {
+    const sheetName = data[i][0] ? data[i][0].toString().trim() : '';
+    if (sheetName === name) {
+      const token = data[i][1] ? data[i][1].toString().trim() : '';
+      const chatId = data[i][2] ? data[i][2].toString().trim() : '';
+      if (token && chatId) {
+        return { token: token, chatId: chatId };
+      }
+    }
+  }
+  return null;
+}
+
+function getAllTelegramContacts() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const tgSheet = ss.getSheetByName(TELEGRAM_SHEET_NAME);
+  if (!tgSheet) {
+    console.error('Telegram sheet not found');
+    return [];
+  }
+  const data = tgSheet.getDataRange().getValues();
+  const contacts = [];
+  for (let i = 1; i < data.length; i++) {
+    const name = data[i][0] ? data[i][0].toString().trim() : '';
+    const token = data[i][1] ? data[i][1].toString().trim() : '';
+    const chatId = data[i][2] ? data[i][2].toString().trim() : '';
+    if (name && token && chatId) {
+      contacts.push({ name: name, token: token, chatId: chatId });
+    }
+  }
+  return contacts;
+}
+
+function sendTelegramMessageWithContact(text, contactName) {
+  const config = getTelegramConfigByName(contactName);
+  if (!config) {
+    SpreadsheetApp.getUi().alert('Could not find configuration for "' + contactName + '" in the Telegram sheet.');
+    return false;
+  }
+  const url = 'https://api.telegram.org/bot' + config.token + '/sendMessage';
+  const payload = {
+    'method': 'post',
+    'contentType': 'application/json',
+    'muteHttpExceptions': true,
+    'payload': JSON.stringify({
+      'chat_id': config.chatId,
+      'text': text,
+      'parse_mode': 'Markdown'
+    })
+  };
+  try {
+    const response = UrlFetchApp.fetch(url, payload);
+    const json = JSON.parse(response.getContentText());
+    return json.ok;
+  } catch (error) {
+    console.error('Telegram error: ' + error);
+    return false;
+  }
+}
+
+/* ================================================================
+ *  onEdit & onChange (triggers)
+ * ================================================================ */
+
+function onEdit(e) {
+  if (!e || !e.range) return;
+  const sheet = e.range.getSheet();
+  if (sheet.getName() !== SALES_SHEET_NAME) return;
+  try {
+    Utilities.sleep(1000);
+    fillEditedRows_(sheet, e.range);
+  } catch (err) {
+    console.error('Items conversion failed: ' + err);
+  }
+}
+
+function onSourceRowInsert(e) {
+  if (CacheService.getScriptCache().get(WRITE_GUARD_KEY)) return;
+  const type = (e && e.changeType) ? e.changeType : 'OTHER';
+  if (['FORMAT', 'REMOVE_ROW', 'REMOVE_COLUMN', 'INSERT_COLUMN', 'REMOVE_GRID'].indexOf(type) !== -1) return;
+  Utilities.sleep(PROCESSING_DELAY);
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SALES_SHEET_NAME);
+  if (!sheet) return;
+  try {
+    processAllItems_(sheet);
+  } catch (err) {
+    console.error('Items conversion (onChange) failed: ' + err);
+  }
+}
+
+/* ================================================================
+ *  PROCESSING FUNCTIONS (no dropdown logic)
+ * ================================================================ */
+
+/**
+ * Process a single part (item) and return its short name and quantity.
+ * This function does NOT touch the sheet; it only computes the conversion.
+ */
+function processSingleItem_(part, lookup) {
+  let short = null;
+  let quantity = '';
+
+  // Check if it's already a short name (case‑insensitive)
+  if (lookup.shortSet[part.toLowerCase()]) {
+    return { short: part, quantity: '' };
+  }
+
+  const { productName, quantity: qty } = extractProductAndQuantity(part);
+  if (!productName || productName.length < 2) {
+    return { short: null, quantity: '' };
+  }
+
+  short = matchShortName_(productName, lookup);
+  if (!short) {
+    // Generate new short name
+    const existingShortNames = lookup.allShortNames || [];
+    short = generateShortName(productName, existingShortNames);
+    // Add to lookup sheet
+    addToLookupSheet(productName, short);
+    // Update the lookup object for subsequent parts in the same batch
+    const newLookup = buildLookup_();
+    lookup.entries = newLookup.entries;
+    lookup.exact = newLookup.exact;
+    lookup.shortSet = newLookup.shortSet;
+    lookup.colorByShort = newLookup.colorByShort;
+    lookup.allShortNames = newLookup.allShortNames;
+  }
+
+  if (short) {
+    const numericQty = extractNumericQuantity(qty);
+    return { short: short, quantity: numericQty };
+  }
+
+  return { short: null, quantity: '' };
+}
+
+/**
+ * Writes the processed items to the cell, one item at a time with delays,
+ * building the text with newlines. No validation is involved.
+ */
+function processAndWriteItems_(sheet, row, itemsCol, value, lookup) {
+  if (!value) {
+    return { allItems: [], quantities: [] };
+  }
+
+  const original = String(value);
+  const parts = original.split(/[\n;,]+/).map(s => s.trim()).filter(s => s);
+  if (parts.length === 0) {
+    return { allItems: [], quantities: [] };
+  }
+
+  // Single item – write directly
+  if (parts.length === 1) {
+    const result = processSingleItem_(parts[0], lookup);
+    let outputText = result.short || parts[0];
+    const allItems = [{ shortName: outputText }];
+    const quantities = [result.quantity || ''];
+    const cell = sheet.getRange(row, itemsCol);
+    cell.setValue(outputText);
+    applyItemFormatting_(cell, outputText);
+    return { allItems: allItems, quantities: quantities };
+  }
+
+  // Multiple items – process sequentially with writes in between
+  const allItems = [];
+  const quantities = [];
+  let cumulativeText = '';
+
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    const result = processSingleItem_(part, lookup);
+    let outputShort = result.short || part;
+    allItems.push({ shortName: outputShort });
+    quantities.push(result.quantity || '');
+
+    cumulativeText = (i === 0) ? outputShort : cumulativeText + '\n' + outputShort;
+
+    const cell = sheet.getRange(row, itemsCol);
+    cell.setValue(cumulativeText);
+    // Apply formatting (font size 14, bold, font color)
+    applyRichTextFormatting_(cell, allItems.map(item => item.shortName));
+
+    if (i < parts.length - 1) {
+      Utilities.sleep(BATCH_ITEM_DELAY);
+      SpreadsheetApp.flush();
+    }
+  }
+
+  return { allItems: allItems, quantities: quantities };
+}
+
+/* ================================================================
+ *  FORMATTING FUNCTIONS (font only – no background)
+ * ================================================================ */
+
+/**
+ * Applies formatting to a cell containing a single short name.
+ * Font size 14, bold, font color derived from the text.
+ */
+function applyItemFormatting_(cell, shortName) {
+  const fontColor = getFontColorForText(shortName);
+  cell.setFontSize(14);
+  cell.setFontWeight('bold');
+  cell.setFontColor(fontColor);
+  // Do NOT set background – leave as is
+}
+
+/**
+ * Applies rich text formatting to a cell with multiple lines.
+ * Each line gets font size 14, bold, and its own font color.
+ * No background is set.
+ */
+function applyRichTextFormatting_(cell, shortNames) {
+  if (!shortNames || shortNames.length === 0) return;
+
+  const richTextBuilder = SpreadsheetApp.newRichTextValue();
+  let fullText = '';
+  const segments = [];
+
+  shortNames.forEach((name, index) => {
+    const fontColor = getFontColorForText(name);
+    const prefix = (index > 0) ? '\n' : '';
+    const textToAdd = prefix + name;
+    segments.push({
+      start: fullText.length,
+      end: fullText.length + textToAdd.length,
+      fontColor: fontColor
+    });
+    fullText += textToAdd;
+  });
+
+  richTextBuilder.setText(fullText);
+  segments.forEach(seg => {
+    richTextBuilder.setTextStyle(seg.start, seg.end,
+      SpreadsheetApp.newTextStyle()
+        .setForegroundColor(seg.fontColor)
+        .setFontSize(14)
+        .setBold(true)
+        .build()
+    );
+  });
+
+  cell.setRichTextValue(richTextBuilder.build());
+  cell.setWrap(true);
+  // No background set
+}
+
+/* ================================================================
+ *  PROCESS ALL ITEMS (main entry)
+ * ================================================================ */
+
+function processAllItems_(sheet) {
+  const lastCol = sheet.getLastColumn();
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return 0;
+
+  const headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(h => String(h).trim());
+  const itemsIdx = headers.indexOf(ITEMS_HEADER);
+  const quantityIdx = headers.indexOf(ITEM_QUANTITY_HEADER);
+  const totalQuantityIdx = headers.indexOf(TOTAL_QUANTITY_HEADER);
+  
+  if (itemsIdx === -1) return 0;
+
+  const itemsCol = itemsIdx + 1;
+  const quantityCol = quantityIdx !== -1 ? quantityIdx + 1 : -1;
+  const totalQuantityCol = totalQuantityIdx !== -1 ? totalQuantityIdx + 1 : -1;
+  
+  let lookup = buildLookup_();
+
+  let changed = 0;
+  const changedRows = [];
+
+  for (let i = 0; i < lastRow - 1; i++) {
+    const row = i + 2;
+    const current = sheet.getRange(row, itemsCol).getValue();
+    if (!current) continue;
+
+    const res = processAndWriteItems_(sheet, row, itemsCol, current, lookup);
+    // After processing, update lookup in case new items were added
+    lookup = buildLookup_(); // refresh for next rows
+
+    const newText = sheet.getRange(row, itemsCol).getValue();
+    if (newText !== String(current) && res.allItems.length > 0) {
+      changed++;
+      changedRows.push({ row: row, allItems: res.allItems, quantities: res.quantities });
+    }
+  }
+
+  if (changed > 0) {
+    for (let q = 0; q < changedRows.length; q++) {
+      const summary = summarizeQuantities_(changedRows[q].quantities);
+      if (quantityCol !== -1) {
+        sheet.getRange(changedRows[q].row, quantityCol).setValue(summary.list);
+      }
+      if (totalQuantityCol !== -1) {
+        sheet.getRange(changedRows[q].row, totalQuantityCol).setValue(summary.total);
+      }
+    }
+  }
+
+  return changed;
+}
+
+function fillEditedRows_(sheet, range) {
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(h => String(h).trim());
+  const itemsIdx = headers.indexOf(ITEMS_HEADER);
+  const quantityIdx = headers.indexOf(ITEM_QUANTITY_HEADER);
+  const totalQuantityIdx = headers.indexOf(TOTAL_QUANTITY_HEADER);
+  
+  if (itemsIdx === -1) return;
+
+  const itemsCol = itemsIdx + 1;
+  const quantityCol = quantityIdx !== -1 ? quantityIdx + 1 : -1;
+  const totalQuantityCol = totalQuantityIdx !== -1 ? totalQuantityIdx + 1 : -1;
+  
+  const startRow = range.getRow();
+  const startCol = range.getColumn();
+  const numRows = range.getNumRows();
+  const numCols = range.getNumColumns();
+
+  if (itemsCol < startCol || itemsCol > startCol + numCols - 1) return;
+
+  let lookup = buildLookup_();
+
+  runGuarded_(() => {
+    const changedRows = [];
+    
+    for (let r = 0; r < numRows; r++) {
+      const row = startRow + r;
+      if (row === 1) continue;
+      
+      const current = sheet.getRange(row, itemsCol).getValue();
+      if (!current) continue;
+
+      const res = processAndWriteItems_(sheet, row, itemsCol, current, lookup);
+      lookup = buildLookup_(); // refresh
+
+      const newText = sheet.getRange(row, itemsCol).getValue();
+      if (newText !== String(current) && res.allItems.length > 0) {
+        changedRows.push({ row: row, allItems: res.allItems, quantities: res.quantities });
+      }
+    }
+
+    for (let q = 0; q < changedRows.length; q++) {
+      const summary = summarizeQuantities_(changedRows[q].quantities);
+      if (quantityCol !== -1) {
+        sheet.getRange(changedRows[q].row, quantityCol).setValue(summary.list);
+      }
+      if (totalQuantityCol !== -1) {
+        sheet.getRange(changedRows[q].row, totalQuantityCol).setValue(summary.total);
+      }
+    }
+  });
+}
+
+/* ================================================================
+ *  LOOKUP BUILDING (unchanged, but still returns color info for fallback if needed)
+ * ================================================================ */
+
+function buildLookup_() {
+  const empty = { entries: [], exact: {}, shortSet: {}, colorByShort: {}, allShortNames: [] };
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(LOOKUP_SHEET_NAME);
+  if (!sh) {
+    Logger.log('Lookup sheet not found, returning empty lookup');
+    return empty;
+  }
+
+  const dataRange = sh.getDataRange();
+  const values = dataRange.getValues();
+  if (values.length < 2) {
+    Logger.log('Lookup sheet has no data, returning empty lookup');
+    return empty;
+  }
+
+  const backgrounds = dataRange.getBackgrounds();
+  const fontColors  = dataRange.getFontColors();
+
+  const headers = values[0].map(h => String(h).trim());
+  const nameIdx = headers.indexOf(LOOKUP_NAME_HEADER);
+  const shortIdx = headers.indexOf(LOOKUP_SHORT_HEADER);
+  if (nameIdx === -1 || shortIdx === -1) {
+    Logger.log('Missing required headers in lookup sheet, returning empty');
+    return empty;
+  }
+
+  const entries = [];
+  const exact = {};
+  const shortSet = {};
+  const colorByShort = {};
+  const allShortNames = [];
+  const seenShort = {};
+
+  for (let i = 1; i < values.length; i++) {
+    const rawName = values[i][nameIdx];
+    const rawShort = values[i][shortIdx];
+    if (!rawName || rawName === '' || !rawShort || rawShort === '') continue;
+    
+    const short = String(rawShort).trim();
+    const lowerShort = short.toLowerCase();
+    shortSet[lowerShort] = true;
+
+    if (!seenShort[lowerShort]) {
+      seenShort[lowerShort] = true;
+      allShortNames.push(short);
+      // Store background and font from sheet (may be used elsewhere, but we ignore background in final output)
+      const bg = (backgrounds && backgrounds[i] && backgrounds[i][shortIdx]) ? backgrounds[i][shortIdx] : DEFAULT_BG_COLOR;
+      const font = (fontColors && fontColors[i] && fontColors[i][shortIdx]) ? fontColors[i][shortIdx] : DEFAULT_FONT_COLOR;
+      colorByShort[lowerShort] = { bg: bg, font: font };
+    }
+    
+    const norm = normalizeForMatch_(rawName);
+    if (!norm) continue;
+    const simpleNorm = simplifyProductName_(norm);
+    exact[norm] = short;
+    if (simpleNorm && simpleNorm !== norm) {
+      exact[simpleNorm] = short;
+    }
+    entries.push({ 
+      norm: norm, 
+      simpleNorm: simpleNorm,
+      tokens: tokensOf_(norm), 
+      short: short,
+      rawName: rawName
+    });
+  }
+
+  return { entries: entries, exact: exact, shortSet: shortSet, colorByShort: colorByShort, allShortNames: allShortNames };
+}
+
+/* ================================================================
+ *  PRODUCT NAME FUNCTIONS (unchanged)
+ * ================================================================ */
+
+function simplifyProductName_(normStr) {
+  const colorWords = ['black', 'white', 'green', 'red', 'blue', 'yellow', 'golden', 'emerald', 'octagon', 'round', 'square'];
+  let words = normStr.split(' ');
+  let simplified = words.filter(word => {
+    return !colorWords.includes(word) && word.length > 2;
+  }).slice(0, 3).join(' ');
+  return simplified;
+}
+
+function extractProductAndQuantity(value) {
+  let str = String(value).trim();
+  let quantity = '';
+  
+  const leadingMatch = str.match(/^(\d+\s*[*x\u00d7]\s*)/i);
+  if (leadingMatch) {
+    quantity = leadingMatch[1].trim();
+    str = str.substring(leadingMatch[0].length).trim();
+  }
+  
+  const trailingMatch = str.match(/\s*([x\u00d7]\s*\d+)\s*$/i);
+  if (trailingMatch) {
+    quantity = trailingMatch[1].trim();
+    str = str.substring(0, str.length - trailingMatch[0].length).trim();
+  }
+  
+  let descriptiveWords = '';
+  const parenMatch = str.match(/\(([^)]+)\)/);
+  if (parenMatch && parenMatch[1]) {
+    descriptiveWords = parenMatch[1];
+  }
+  
+  str = str.replace(/\s*\([^)]*\)\s*/g, ' ');
+  str = str.replace(/\s+/g, ' ').trim();
+  
+  if (descriptiveWords) {
+    descriptiveWords = descriptiveWords.replace(/\b(shape|round|square|octagon|emerald|golden)\b/gi, '');
+    descriptiveWords = descriptiveWords.trim();
+    if (descriptiveWords) {
+      str = str + ' ' + descriptiveWords;
+    }
+  }
+  
+  return { 
+    productName: str.trim(),
+    quantity: quantity
+  };
+}
+
+function normalizeForMatch_(value) {
+  if (!value) return '';
+  const { productName } = extractProductAndQuantity(value);
+  let str = productName;
+  str = str
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return str;
+}
+
+function tokensOf_(normStr) {
+  return normStr.split(' ').filter(w => w.length >= 2);
+}
+
+function matchShortName_(searchTerm, lookup) {
+  const nSearch = normalizeForMatch_(searchTerm);
+  if (!nSearch) return null;
+
+  if (Object.prototype.hasOwnProperty.call(lookup.exact, nSearch)) {
+    return lookup.exact[nSearch];
+  }
+
+  const searchWords = tokensOf_(nSearch);
+  if (searchWords.length === 0) return null;
+
+  let bestShort = null;
+  let bestScore = 0;
+
+  for (let i = 0; i < lookup.entries.length; i++) {
+    const entry = lookup.entries[i];
+    const productWords = entry.tokens;
+    if (productWords.length === 0) continue;
+
+    let matched = 0;
+    let weightedMatches = 0;
+    
+    for (let s = 0; s < searchWords.length; s++) {
+      const sw = searchWords[s];
+      if (sw.length < 2) continue;
+      
+      let hit = false;
+      let bestWordScore = 0;
+      
+      for (let p = 0; p < productWords.length; p++) {
+        const pw = productWords[p];
+        if (pw.length < 2) continue;
+        
+        if (pw === sw) { 
+          hit = true; 
+          bestWordScore = 1.0;
+          break; 
+        }
+        
+        if (pw.length >= 3 && sw.length >= 3) {
+          if (pw.indexOf(sw) !== -1 || sw.indexOf(pw) !== -1) {
+            const score = Math.min(pw.length, sw.length) / Math.max(pw.length, sw.length);
+            if (score > bestWordScore) {
+              bestWordScore = score;
+              hit = true;
+            }
+          }
+        }
+      }
+      
+      if (hit) {
+        matched++;
+        weightedMatches += bestWordScore;
+      }
+    }
+    
+    if (matched === 0) continue;
+
+    const recall = matched / searchWords.length;
+    const precision = matched / productWords.length;
+    const f1Score = (2 * precision * recall) / (precision + recall);
+    const significantBoost = (matched >= Math.min(searchWords.length, productWords.length) * 0.5) ? 0.2 : 0;
+    const finalScore = f1Score + significantBoost;
+
+    if (finalScore > bestScore) {
+      bestScore = finalScore;
+      bestShort = entry.short;
+    }
+  }
+
+  return bestScore >= MATCH_THRESHOLD ? bestShort : null;
+}
+
+function runGuarded_(writeFn) {
+  CacheService.getScriptCache().put(WRITE_GUARD_KEY, '1', 30);
+  writeFn();
+  SpreadsheetApp.flush();
+}
+
+/* ================================================================
+ *  MENU FUNCTIONS (dropdown related removed)
+ * ================================================================ */
+
+function convertAllItemsToShortNames() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(SALES_SHEET_NAME);
+  if (!sheet) {
+    SpreadsheetApp.getUi().alert('Sheet "' + SALES_SHEET_NAME + '" not found.');
+    return;
+  }
+
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(h => String(h).trim());
+  if (headers.indexOf(ITEMS_HEADER) === -1) {
+    SpreadsheetApp.getUi().alert('Row 1 of "' + SALES_SHEET_NAME + '" must contain "' + ITEMS_HEADER + '".');
+    return;
+  }
+
+  const changed = processAllItems_(sheet);
+  SpreadsheetApp.getUi().alert('Done. Converted ' + changed + ' "' + ITEMS_HEADER + '" cell(s).');
+}
+
+// Removed setupColumnDropdown and refreshDropdown – no longer needed
+
+function testMatching() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const lookup = buildLookup_();
+    const dropdownValues = lookup.allShortNames || [];
+    if (lookup.entries.length === 0) {
+      ui.alert('No entries found in the Product Short Name sheet.');
+      return;
+    }
+    const testCases = [
+      'Marble Kitchen Piri - Emerald Green Octagon Shape x1',
+      'Granite Kitchen Piri – Black Round Shape x2',
+      'Marble Kitchen Piri/Chakla (White Round) x7',
+      'Marble Kitchen Piri/Chakla (Black Round) x3',
+      'New Unknown Product with Red Color x4'
+    ];
+    let results = '🧪 SHORT NAME & QUANTITY TEST\n';
+    results += '═'.repeat(60) + '\n\n';
+    results += '📌 ITEMS Column: short name (no quantity)\n';
+    results += '📌 ITEM QUANTITY Column: values comma separated (e.g. 1, 2)\n';
+    results += '📌 TOTAL QUANTITY Column: summation of those values\n\n';
+    testCases.forEach((test, index) => {
+      const { productName, quantity } = extractProductAndQuantity(test);
+      let short = matchShortName_(productName, lookup);
+      let generated = false;
+      if (!short) {
+        short = generateShortName(productName, dropdownValues);
+        generated = true;
+      }
+      const numericQty = extractNumericQuantity(quantity);
+      const summary = summarizeQuantities_([numericQty]);
+      results += `Test ${index + 1}: "${test}"\n`;
+      results += `  Product: "${productName}"\n`;
+      results += `  Short Name: "${short}"`;
+      if (generated) results += ' (🆕 Newly Generated)';
+      results += '\n';
+      results += `  ✅ ITEM QUANTITY: "${summary.list}"   TOTAL: ${summary.total}\n\n`;
+    });
+    const multi = ['x2', 'x3', 'x1'].map(extractNumericQuantity);
+    const multiSummary = summarizeQuantities_(multi);
+    results += '─'.repeat(60) + '\n';
+    results += 'Multi-item order example (qty x2, x3, x1):\n';
+    results += `  ✅ ITEM QUANTITY: "${multiSummary.list}"\n`;
+    results += `  ✅ TOTAL QUANTITY: ${multiSummary.total}\n`;
+    ui.alert('Test Results', results, ui.ButtonSet.OK);
+  } catch (error) {
+    ui.alert('Error', error.toString(), ui.ButtonSet.OK);
+  }
+}
+
+function testTelegramContacts() {
+  Logger.log('=== Testing Telegram Contacts ===');
+  const contacts = getAllTelegramContacts();
+  Logger.log('Contacts found: ' + contacts.length);
+  contacts.forEach(contact => {
+    Logger.log('  ' + contact.name + ' -> Token: ' + contact.token.substring(0, 10) + '... Chat: ' + contact.chatId);
+  });
+}
+
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+  ui.createMenu('Sales Tools')
+    .addItem('🔄 Convert Items', 'convertAllItemsToShortNames')
+    .addSeparator()
+    .addItem('🧪 Test Matching & Quantity', 'testMatching')
+    .addSeparator()
+    .addItem('Test Telegram Contacts', 'testTelegramContacts')
+    .addToUi();
+}
+
+/* ================================================================
+ *  TELEGRAM DISPATCH (unchanged)
+ * ================================================================ */
+
+function onDropdownEdit(e) {
+  if (!e) {
+    SpreadsheetApp.getUi().alert("Don't run this directly from the script editor.");
+    return;
+  }
+  const range = e.range;
+  const sheet = range.getSheet();
+  const sheetName = sheet.getName();
+  if (sheetName === TELEGRAM_SHEET_NAME || sheetName === LOOKUP_SHEET_NAME) return;
+  handleTelegramSend(e, sheet, range);
+}
+
+function handleTelegramSend(e, sheet, range) {
+  const row = range.getRow();
+  const col = range.getColumn();
+  const newValue = e.value;
+
+  if (row === 1 || !newValue) return;
+
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const actionIdx = headers.indexOf('Action');
+
+  if (actionIdx === -1 || col !== (actionIdx + 1) || newValue !== 'Send') return;
+
+  const statusIdx = headers.indexOf('Status');
+  const orderIdIdx = headers.indexOf('Order ID');
+  const courierIdIdx = headers.indexOf('Courier ID');
+  const itemsQuantityIdx = headers.indexOf(ITEMS_HEADER);
+  const assignedTgIdx = headers.indexOf('Assigned Telegram');
+
+  const requiredHeaders = {
+    'Order ID': orderIdIdx,
+    'Courier ID': courierIdIdx,
+    'Items': itemsQuantityIdx,
+    'Assigned Telegram': assignedTgIdx,
+    'Status': statusIdx,
+    'Action': actionIdx
+  };
+  const missing = Object.keys(requiredHeaders).filter(k => requiredHeaders[k] === -1);
+  if (missing.length > 0) {
+    SpreadsheetApp.getUi().alert(
+      "Setup Error: these exact column headers are missing from Row 1:\n\n" +
+      missing.map(h => `- '${h}'`).join("\n")
+    );
+    return;
+  }
+
+  const statusRange = sheet.getRange(row, statusIdx + 1);
+  const currentStatus = statusRange.getValue();
+
+  if (currentStatus === 'Sent') {
+    SpreadsheetApp.getUi().alert('This order has already been sent to Telegram!');
+    range.setValue('');
+    return;
+  }
+
+  const rowData = sheet.getRange(row, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const orderId = rowData[orderIdIdx] || 'N/A';
+  const courierId = rowData[courierIdIdx] || 'N/A';
+  const itemsQuantity = rowData[itemsQuantityIdx] || 'N/A';
+  const telegramName = rowData[assignedTgIdx];
+
+  if (!telegramName) {
+    SpreadsheetApp.getUi().alert('Assign a Telegram contact in "Assigned Telegram" for row ' + row + ' before sending.');
+    range.setValue('');
+    return;
+  }
+
+  const config = getTelegramConfigByName(telegramName);
+  if (!config) {
+    SpreadsheetApp.getUi().alert('Could not find configuration for "' + telegramName + '" in the Telegram sheet.');
+    range.setValue('');
+    return;
+  }
+
+  const message = '📦 *New Order Notification* \n\n' +
+                  '🆔 *Order ID:* ' + orderId + '\n' +
+                  '🚚 *Courier ID:* ' + courierId + '\n' +
+                  '🛒 *Items:* ' + itemsQuantity;
+
+  const success = sendTelegramMessageWithContact(message, telegramName);
+
+  if (success) {
+    statusRange.setValue('Sent');
+    statusRange.setBackground('#d9ead3');
+  }
+  range.setValue('');
+}
