@@ -1,0 +1,471 @@
+<?php
+/**
+ * Plugin Name: WooFlow
+ * Description: Adds an export button to each WooCommerce order row that appends data directly to a Google Sheet via the Google Sheets API and then to telegram group from google sheet
+ * Version: 1.0.1
+ * Author: Mohammod Hamed Hasan
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+// ==========================================
+// 1. SETTINGS PAGE
+// ==========================================
+add_action('admin_menu', 'woosheet_register_settings_page');
+function woosheet_register_settings_page() {
+    add_options_page('WooSheet Settings', 'WooSheet', 'manage_options', 'woosheet-settings', 'woosheet_settings_page_html');
+}
+
+function woosheet_settings_page_html() {
+    if (!current_user_can('manage_options')) return;
+
+    if (isset($_POST['woosheet_save_settings']) && check_admin_referer('woosheet_save_nonce')) {
+        update_option('woosheet_sheet_id', sanitize_text_field($_POST['woosheet_sheet_id']));
+        update_option('woosheet_sheet_tab', sanitize_text_field($_POST['woosheet_sheet_tab']));
+        update_option('woosheet_debug_mode', isset($_POST['woosheet_debug_mode']) ? 1 : 0);
+
+        if (!empty($_POST['woosheet_service_account_json'])) {
+            $json_raw = wp_unslash($_POST['woosheet_service_account_json']);
+            $decoded  = json_decode($json_raw, true);
+            if (is_array($decoded) && isset($decoded['private_key'], $decoded['client_email'])) {
+                update_option('woosheet_service_account_json', $json_raw, false);
+                delete_transient('woosheet_google_access_token');
+                echo '<div class="notice notice-success"><p>Settings saved! New service account key stored.</p></div>';
+            } else {
+                echo '<div class="notice notice-error"><p>Invalid service account JSON. Key was NOT saved.</p></div>';
+            }
+        } else {
+            echo '<div class="notice notice-success"><p>Settings saved!</p></div>';
+        }
+    }
+
+    $sheet_id   = get_option('woosheet_sheet_id', '');
+    $sheet_tab  = get_option('woosheet_sheet_tab', 'Sheet1');
+    $debug_mode = get_option('woosheet_debug_mode', 0);
+    $has_key    = !empty(get_option('woosheet_service_account_json', ''));
+    $client_email = '';
+    if ($has_key) {
+        $decoded = json_decode(get_option('woosheet_service_account_json'), true);
+        $client_email = $decoded['client_email'] ?? '';
+    }
+    ?>
+    <div class="wrap">
+        <h1>WooSheet Settings</h1>
+        <form method="POST" action="">
+            <?php wp_nonce_field('woosheet_save_nonce'); ?>
+            <table class="form-table">
+                <tr>
+                    <th scope="row"><label for="woosheet_sheet_id">Google Sheet ID</label></th>
+                    <td>
+                        <input type="text" id="woosheet_sheet_id" name="woosheet_sheet_id" value="<?php echo esc_attr($sheet_id); ?>" class="regular-text" required>
+                        <p class="description">From your sheet URL: docs.google.com/spreadsheets/d/<strong>THIS_PART</strong>/edit</p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="woosheet_sheet_tab">Sheet/Tab Name</label></th>
+                    <td>
+                        <input type="text" id="woosheet_sheet_tab" name="woosheet_sheet_tab" value="<?php echo esc_attr($sheet_tab); ?>" class="regular-text" required>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="woosheet_service_account_json">Service Account JSON Key</label></th>
+                    <td>
+                        <textarea id="woosheet_service_account_json" name="woosheet_service_account_json" class="large-text code" rows="8" placeholder="<?php echo $has_key ? 'A key is already saved. Paste a new one only to replace it.' : 'Paste the full contents of your downloaded service account JSON file here'; ?>"></textarea>
+                        <p class="description">
+                            <?php if ($has_key): ?>
+                                <span style="color:#2271b1;">&#10003; A service account key is currently saved (<code><?php echo esc_html($client_email); ?></code>).</span>
+                            <?php else: ?>
+                                No key saved yet.
+                            <?php endif; ?>
+                            <br>Don't forget: share your Google Sheet with <code><?php echo $has_key ? esc_html($client_email) : 'the client_email from your JSON key'; ?></code> as <strong>Editor</strong>.
+                        </p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="woosheet_debug_mode">Enable Debug Mode</label></th>
+                    <td>
+                        <label><input type="checkbox" id="woosheet_debug_mode" name="woosheet_debug_mode" value="1" <?php checked(1, $debug_mode); ?>> Show exact API errors and JSON payload on screen</label>
+                    </td>
+                </tr>
+            </table>
+            <p class="submit"><input type="submit" name="woosheet_save_settings" class="button-primary" value="Save Settings"></p>
+        </form>
+        <hr>
+        <h2>Your Google Sheet Row 1 MUST match these exact headers, in this order:</h2>
+        <p style="background:#f0f0f1; padding:10px; font-family:monospace;">
+            SL | Courier ID | Order ID | Date | Customer Name | Phone | Items | Item Quantity | Total Quantity | Amount (BDT) | Delivery Charge | ADC | Address | Order Notes | Source
+        </p>
+        <p><strong>Important:</strong> Columns <code>Item Quantity</code>, <code>Total Quantity</code>, and <code>ADC</code> are left empty by this plugin. They are filled automatically by the Google Apps Script.</p>
+    </div>
+    <?php
+}
+
+// ==========================================
+// 2. ADD THE EXPORT BUTTON (HPOS & LEGACY)
+// ==========================================
+add_filter('manage_edit-shop_order_columns', 'woosheet_add_export_column');
+add_action('manage_shop_order_posts_custom_column', 'woosheet_render_export_column', 10, 2);
+add_filter('manage_woocommerce_page_wc-orders_columns', 'woosheet_add_export_column');
+add_action('manage_woocommerce_page_wc-orders_custom_column', 'woosheet_render_export_column_hpos', 10, 2);
+
+function woosheet_add_export_column($columns) {
+    $columns['woosheet_export'] = __('Export to Sheet', 'wse');
+    return $columns;
+}
+
+function woosheet_render_export_column($column, $post_id) {
+    if ($column === 'woosheet_export') woosheet_output_button($post_id);
+}
+
+function woosheet_render_export_column_hpos($column, $order) {
+    if ($column === 'woosheet_export') woosheet_output_button($order->get_id());
+}
+
+// ==========================================
+// 3. GOOGLE AUTH HELPERS
+// ==========================================
+function woosheet_base64url_encode($data) {
+    return rtrim(strtr(base64_encode($data), '+/', '-_'), '=');
+}
+
+function woosheet_get_google_access_token() {
+    $cached = get_transient('woosheet_google_access_token');
+    if ($cached) return $cached;
+
+    $json_raw = get_option('woosheet_service_account_json', '');
+    if (empty($json_raw)) return new WP_Error('no_key', 'No service account JSON key saved.');
+
+    $creds = json_decode($json_raw, true);
+    if (!is_array($creds) || empty($creds['private_key']) || empty($creds['client_email']) || empty($creds['token_uri'])) {
+        return new WP_Error('bad_key', 'Service account JSON is missing required fields.');
+    }
+
+    $now = time();
+    $header = ['alg' => 'RS256', 'typ' => 'JWT'];
+    $claims = [
+        'iss'   => $creds['client_email'],
+        'scope' => 'https://www.googleapis.com/auth/spreadsheets',
+        'aud'   => $creds['token_uri'],
+        'exp'   => $now + 3600,
+        'iat'   => $now,
+    ];
+
+    $segments = [
+        woosheet_base64url_encode(wp_json_encode($header)),
+        woosheet_base64url_encode(wp_json_encode($claims)),
+    ];
+    $signing_input = implode('.', $segments);
+
+    $private_key = openssl_pkey_get_private($creds['private_key']);
+    if (!$private_key) return new WP_Error('bad_private_key', 'Could not parse private_key.');
+
+    $signature = '';
+    $signed_ok = openssl_sign($signing_input, $signature, $private_key, OPENSSL_ALGO_SHA256);
+    if (!$signed_ok) return new WP_Error('sign_fail', 'Failed to sign JWT.');
+
+    $jwt = $signing_input . '.' . woosheet_base64url_encode($signature);
+
+    $response = wp_remote_post($creds['token_uri'], [
+        'method'  => 'POST',
+        'headers' => ['Content-Type' => 'application/x-www-form-urlencoded'],
+        'body'    => [
+            'grant_type' => 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+            'assertion'  => $jwt,
+        ],
+        'timeout' => 15,
+    ]);
+
+    if (is_wp_error($response)) return $response;
+
+    $code = wp_remote_retrieve_response_code($response);
+    $body = json_decode(wp_remote_retrieve_body($response), true);
+
+    if ($code < 200 || $code >= 300 || empty($body['access_token'])) {
+        $error_detail = isset($body['error_description']) ? $body['error_description'] : wp_remote_retrieve_body($response);
+        return new WP_Error('token_fail', 'Google rejected token (HTTP ' . $code . '): ' . $error_detail);
+    }
+
+    $access_token = $body['access_token'];
+    $expires_in   = isset($body['expires_in']) ? (int) $body['expires_in'] : 3600;
+    set_transient('woosheet_google_access_token', $access_token, max(60, $expires_in - 300));
+
+    return $access_token;
+}
+
+function woosheet_output_button($order_id) {
+    $order = wc_get_order($order_id);
+    // Check if this order has a saved export flag in the database
+    $is_exported = $order ? $order->get_meta('_woosheet_is_exported') : '';
+
+    if ($is_exported === 'yes') {
+        // Render the dark-green permanent success button
+        echo '<button class="woosheet_ajax_export_btn is-success" disabled>Success</button>';
+    } else {
+        // Render the normal light-green export button
+        $nonce = wp_create_nonce('woosheet_export_nonce_' . $order_id);
+        echo '<button class="woosheet_ajax_export_btn" data-order-id="' . esc_attr($order_id) . '" data-nonce="' . esc_attr($nonce) . '">Export</button>';
+    }
+}
+
+function woosheet_append_row_to_sheet($row_values) {
+    $sheet_id  = get_option('woosheet_sheet_id', '');
+    $sheet_tab = get_option('woosheet_sheet_tab', 'Sheet1');
+
+    if (empty($sheet_id)) return new WP_Error('no_sheet_id', 'No Google Sheet ID configured.');
+
+    $token = woosheet_get_google_access_token();
+    if (is_wp_error($token)) return $token;
+
+    // --- FIX: Send to columns A:O (15 columns) ---
+    $range = rawurlencode($sheet_tab . '!A:O');
+    $url = "https://sheets.googleapis.com/v4/spreadsheets/{$sheet_id}/values/{$range}:append"
+         . "?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS";
+
+    $body = wp_json_encode([
+        'values' => [ $row_values ], // $row_values is already an indexed array
+    ]);
+
+    $response = wp_remote_post($url, [
+        'method'  => 'POST',
+        'headers' => [
+            'Content-Type'  => 'application/json',
+            'Authorization' => 'Bearer ' . $token,
+        ],
+        'body'    => $body,
+        'timeout' => 15,
+    ]);
+
+    if (is_wp_error($response)) return $response;
+
+    $code = wp_remote_retrieve_response_code($response);
+    $resp_body = wp_remote_retrieve_body($response);
+
+    if ($code < 200 || $code >= 300) {
+        return new WP_Error('append_fail', "Google Sheets API returned HTTP {$code}: {$resp_body}");
+    }
+
+    return true;
+}
+
+// ==========================================
+// 4. HANDLE EXPORT BUTTON CLICK (WITH AJAX)
+// ==========================================
+add_action('admin_post_woosheet_send_to_sheet', 'woosheet_process_export');
+add_action('wp_ajax_woosheet_send_to_sheet', 'woosheet_process_export');
+
+function woosheet_process_export() {
+    // Check both GET and POST requests gracefully
+    $order_id = isset($_REQUEST['order_id']) ? absint($_REQUEST['order_id']) : 0;
+    $nonce = isset($_REQUEST['_wpnonce']) ? $_REQUEST['_wpnonce'] : '';
+
+    if (!$order_id || !$nonce) {
+        if (wp_doing_ajax()) wp_send_json_error('Invalid request.');
+        wp_die('Invalid request.');
+    }
+
+    if (!wp_verify_nonce($nonce, 'woosheet_export_nonce_' . $order_id)) {
+        if (wp_doing_ajax()) wp_send_json_error('Security check failed.');
+        wp_die('Security check failed.');
+    }
+
+    if (!current_user_can('edit_shop_orders')) {
+        if (wp_doing_ajax()) wp_send_json_error('No permission.');
+        wp_die('No permission.');
+    }
+
+    $order = wc_get_order($order_id);
+    if (!$order) {
+        if (wp_doing_ajax()) wp_send_json_error('Order not found.');
+        wp_die('Order not found.');
+    }
+
+    $is_debug = get_option('woosheet_debug_mode', 0);
+
+    // 1. Gather Data
+    $items_string = '';
+    foreach ($order->get_items() as $item) {
+        $items_string .= $item->get_name() . ' x' . $item->get_quantity() . '; ';
+    }
+
+    $notes = wc_get_order_notes(['order_id' => $order_id]);
+    $notes_string = '';
+    foreach ($notes as $note) {
+        $notes_string .= strip_tags($note->content) . ' | ';
+    }
+
+    $pathao_id = $order->get_meta('ptc_consignment_id');
+    if (empty($pathao_id)) {
+        $pathao_id = get_post_meta($order_id, 'ptc_consignment_id', true);
+    }
+    
+    if ($pathao_id === '-') {
+        $pathao_id = '';
+    }
+    
+    $steadfast_id = $order->get_meta('steadfast_consignment_id');
+    if (empty($steadfast_id)) {
+        $steadfast_id = get_post_meta($order_id, 'steadfast_consignment_id', true);
+    }
+    if (empty($steadfast_id)) {
+        $steadfast_id = $order->get_meta('_steadfast_consignment_id');
+    }
+    if (empty($steadfast_id)) {
+        $steadfast_id = get_post_meta($order_id, '_steadfast_consignment_id', true);
+    }
+
+    $courier_id = !empty($pathao_id) ? $pathao_id : $steadfast_id;
+
+    // 2. Build the 15-column row (matching A:O)
+    $row_values = [
+        0  => '=ROW()-1',                                           // A: SL
+        1  => (string) $courier_id,                                 // B: Courier ID
+        2  => (string) $order_id,                                   // C: Order ID
+        3  => $order->get_date_created() ? $order->get_date_created()->date('Y-m-d') : '', // D: Date (only date)
+        4  => trim($order->get_billing_first_name() . ' ' . $order->get_billing_last_name()), // E: Customer Name
+        5  => $order->get_billing_phone(),                          // F: Phone
+        6  => trim($items_string, '; '),                            // G: Items (raw string)
+        7  => '',                                                   // H: Item Quantity (left for Apps Script)
+        8  => '',                                                   // I: Total Quantity (left for Apps Script)
+        9  => (string) $order->get_total(),                         // J: Amount (BDT)
+        10 => (string) $order->get_shipping_total(),                // K: Delivery Charge
+        11 => '',                                                   // L: ADC (left for manual entry or other)
+        12 => trim($order->get_billing_address_1() . ' ' . $order->get_billing_address_2() . ', ' . $order->get_billing_city()), // M: Address
+        13 => trim($notes_string, ' |'),                            // N: Order Notes
+        14 => 'WooCommerce',                                        // O: Source
+    ];
+
+    // 3. Send directly to Google Sheets
+    $result = woosheet_append_row_to_sheet($row_values);
+
+    // --- Save the export status to the database on success ---
+    if (!is_wp_error($result)) {
+        $order->update_meta_data('_woosheet_is_exported', 'yes');
+        $order->save();
+    }
+
+    // Handle standard Debug mode if it's not an AJAX call
+    if ($is_debug && !wp_doing_ajax()) {
+        echo '<div style="font-family:monospace; padding:20px; background:#fff; border:1px solid #ccc; margin:20px;">';
+        echo '<h2>Google Sheets API Debug Output</h2>';
+        echo '<h3>1. Result:</h3><pre>' . (is_wp_error($result) ? esc_html($result->get_error_message()) : 'SUCCESS') . '</pre>';
+        echo '<h3>2. 15-Column Row Sent (A:O):</h3><pre>' . esc_html(wp_json_encode($row_values, JSON_PRETTY_PRINT)) . '</pre>';
+        echo '<a href="' . esc_url(admin_url('edit.php?post_type=shop_order')) . '" style="display:inline-block; padding:10px; background:#2271b1; color:#fff; text-decoration:none;">Back to Orders</a>';
+        echo '</div>';
+        exit;
+    }
+
+    // AJAX vs Normal Fallback Responses
+    if (is_wp_error($result)) {
+        if (wp_doing_ajax()) {
+            wp_send_json_error($result->get_error_message());
+        }
+        wp_redirect(add_query_arg('woosheet_error', rawurlencode($result->get_error_message()), wp_get_referer()));
+    } else {
+        if (wp_doing_ajax()) {
+            wp_send_json_success();
+        }
+        wp_redirect(add_query_arg('woosheet_success', '1', wp_get_referer()));
+    }
+    exit;
+}
+
+// ==========================================
+// 5. INJECT BUTTON ASSETS (CSS & JS)
+// ==========================================
+add_action('admin_footer', 'woosheet_inject_admin_assets');
+function woosheet_inject_admin_assets() {
+    $screen = get_current_screen();
+    // Only inject on WooCommerce Order management screen variations
+    if (!isset($screen->id) || !in_array($screen->id, ['edit-shop_order', 'woocommerce_page_wc-orders'])) {
+        return;
+    }
+    ?>
+    <style>
+        /* Initial light-green styling matching Steadfast "Send" button */
+        .woosheet_ajax_export_btn {
+            background-color: #dbeed1 !important;
+            border: 1px solid #cbdcc2 !important;
+            color: #2b5713 !important;
+            padding: 4px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: 500;
+            display: inline-block;
+            text-align: center;
+            min-width: 70px;
+            box-shadow: none;
+            transition: background 0.15s ease-in-out;
+        }
+        .woosheet_ajax_export_btn:hover {
+            background-color: #cbdcc2 !important;
+        }
+        /* Success state styling matching Steadfast "Success" button */
+        .woosheet_ajax_export_btn.is-success {
+            background-color: #258355 !important;
+            border-color: #258355 !important;
+            color: #ffffff !important;
+            pointer-events: none !important;
+            cursor: default;
+        }
+    </style>
+
+    <script type="text/javascript">
+        jQuery(document).ready(function($) {
+            $(document).on('click', '.woosheet_ajax_export_btn', function(e) {
+                e.preventDefault();
+                var $btn = $(this);
+                
+                if ($btn.hasClass('is-success') || $btn.prop('disabled')) {
+                    return;
+                }
+
+                var orderId = $btn.data('order-id');
+                var nonce = $btn.data('nonce');
+
+                // Visual feedback during processing
+                $btn.text('Sending...').prop('disabled', true).css('opacity', '0.7');
+
+                $.ajax({
+                    url: ajaxurl, // global WordPress admin AJAX route
+                    type: 'POST',
+                    data: {
+                        action: 'woosheet_send_to_sheet',
+                        order_id: orderId,
+                        _wpnonce: nonce
+                    },
+                    success: function(response) {
+                        if (response.success) {
+                            $btn.text('Success')
+                                .removeClass('button') // Strip conflicting WP core button rules
+                                .addClass('is-success')
+                                .css('opacity', '1')
+                                .prop('disabled', false);
+                        } else {
+                            alert('Export failed: ' + (response.data || 'Unknown error.'));
+                            $btn.text('Export').prop('disabled', false).css('opacity', '1');
+                        }
+                    },
+                    error: function() {
+                        alert('Network processing error. Please try again.');
+                        $btn.text('Export').prop('disabled', false).css('opacity', '1');
+                    }
+                });
+            });
+        });
+    </script>
+    <?php
+}
+
+// ==========================================
+// 6. SHOW NOTICES
+// ==========================================
+add_action('admin_notices', 'woosheet_export_notices');
+function woosheet_export_notices() {
+    if (isset($_GET['woosheet_success']) && $_GET['woosheet_success'] == '1') {
+        echo '<div class="notice notice-success is-dismissible"><p><strong>Success!</strong> Order data appended to your Google Sheet.</p></div>';
+    }
+    if (isset($_GET['woosheet_error'])) {
+        $err = sanitize_text_field(wp_unslash($_GET['woosheet_error']));
+        echo '<div class="notice notice-error is-dismissible"><p><strong>Export Failed:</strong> ' . esc_html($err) . '</p></div>';
+    }
+}
