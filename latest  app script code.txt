@@ -1,0 +1,878 @@
+/*** ================================================================
+ *  AKRUB SALE REPORT AUTOMATION — v3
+ *
+ *  Core approach: scan rows, SKIP already-converted ones instantly
+ *  (no row tracker needed). Only rows with unconverted Items data
+ *  get processed and written to. Old converted rows are never touched.
+ *
+ *  Fixes included:
+ *    F1) Content-based skip: if Items cell is already all short names → skip
+ *    F2) Quantity date bug: setNumberFormat('@') before setValue
+ *    F3) Row height auto-resize for multi-line cells
+ *    F4) 2000ms delay (proven to work with source plugin)
+ *
+ *  Unchanged: Product Short Name lookup, matching, generation,
+ *  font 14/bold/color formatting, Telegram, quantity logic
+ * ================================================================ */
+
+// ---- Sheet / header names ----------------------------------------
+const SALES_SHEET_NAME     = 'Total Sales';
+const LOOKUP_SHEET_NAME    = 'Product Short Name';
+const TELEGRAM_SHEET_NAME  = 'Telegram';
+const ITEMS_HEADER         = 'Items';
+const ITEM_QUANTITY_HEADER = 'Item Quantity';
+const TOTAL_QUANTITY_HEADER = 'Total Quantity';
+const LOOKUP_NAME_HEADER   = 'Product Name';
+const LOOKUP_SHORT_HEADER  = 'Short Name';
+
+const MATCH_THRESHOLD      = 0.6;
+const WRITE_GUARD_KEY      = 'ITEMS_CONVERTING';
+const PROCESSING_DELAY     = 2000;   // ms — proven delay for source plugin
+const BATCH_ITEM_DELAY     = 200;    // ms between items in multi-item cell
+
+// ---- DEFAULT COLORS ----
+const DEFAULT_FONT_COLOR = '#000000';
+const DEFAULT_BG_COLOR   = '#ffffff';
+
+/* ================================================================
+ *  COLOR MAPPING (font color only — no background)
+ * ================================================================ */
+
+const COLOR_MAP = {
+  'black':   { font: '#000000' },
+  'white':   { font: '#ffffff' },
+  'emerald': { font: '#00897b' },
+  'forest':  { font: '#1b5e20' },
+  'green':   { font: '#2e7d32' },
+  'red':     { font: '#c62828' },
+  'blue':    { font: '#1565c0' },
+  'yellow':  { font: '#f9a825' },
+  'golden':  { font: '#f57f17' },
+  'gold':    { font: '#f57f17' },
+  'brown':   { font: '#4e342e' },
+  'grey':    { font: '#757575' },
+  'gray':    { font: '#757575' },
+  'pink':    { font: '#c2185b' },
+  'purple':  { font: '#7b1fa2' },
+  'orange':  { font: '#e65100' }
+};
+
+function getFontColorForText(text) {
+  var lower = String(text || '').toLowerCase();
+  for (var key in COLOR_MAP) {
+    if (lower.indexOf(key) !== -1) return COLOR_MAP[key].font;
+  }
+  return DEFAULT_FONT_COLOR;
+}
+
+/* ================================================================
+ *  SHORT NAME GENERATION & LOOKUP SHEET
+ * ================================================================ */
+
+function generateShortName(productName, existingShortNames) {
+  var str = String(productName).trim();
+  var material = '';
+  if (str.toLowerCase().includes('marble')) material = 'M';
+  else if (str.toLowerCase().includes('granite')) material = 'G';
+  else if (str.toLowerCase().includes('natural')) material = 'M';
+  else material = 'P';
+
+  var base = 'Piri';
+  if (str.includes('/') && str.toLowerCase().includes('chakla')) base = 'Piri-Chakla';
+  else if (str.toLowerCase().includes('chakla') && !str.toLowerCase().includes('piri')) base = 'Chakla';
+
+  var color = '';
+  var colors = ['Black','White','Green','Red','Blue','Yellow','Golden','Emerald','Brown','Grey'];
+  for (var ci = 0; ci < colors.length; ci++) {
+    if (str.toLowerCase().includes(colors[ci].toLowerCase())) { color = colors[ci]; break; }
+  }
+  if (!color) color = 'Unknown';
+
+  var shape = '';
+  var shapes = ['Round','Octagon','Square','Rectangle','Oval','Hexagon'];
+  for (var si = 0; si < shapes.length; si++) {
+    if (str.toLowerCase().includes(shapes[si].toLowerCase())) { shape = shapes[si]; break; }
+  }
+  if (!shape) shape = 'Shape';
+
+  var shortName = material + '-' + base + '-' + color + '-' + shape;
+  shortName = shortName.replace(/\s+/g, '-').replace(/[^a-zA-Z0-9\-]/g, '');
+
+  var uniqueName = shortName;
+  var counter = 1;
+  while (existingShortNames && existingShortNames.includes(uniqueName)) {
+    uniqueName = shortName + '-' + counter;
+    counter++;
+  }
+  return uniqueName;
+}
+
+function addToLookupSheet(productName, shortName) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var lookupSheet = ss.getSheetByName(LOOKUP_SHEET_NAME);
+  if (!lookupSheet) { Logger.log('ERROR: Lookup sheet not found'); return null; }
+
+  var lastRow = lookupSheet.getLastRow();
+  lookupSheet.getRange(lastRow + 1, 1).setValue(productName);
+  lookupSheet.getRange(lastRow + 1, 2).setValue(shortName);
+  lookupSheet.getRange(lastRow + 1, 2).setFontColor(getFontColorForText(shortName));
+  SpreadsheetApp.flush();
+
+  Logger.log('Added to lookup: "' + productName + '" -> "' + shortName + '"');
+  return { row: lastRow + 1, shortName: shortName };
+}
+
+/* ================================================================
+ *  QUANTITY EXTRACTION & SUMMARIZATION
+ * ================================================================ */
+
+function extractNumericQuantity(quantityStr) {
+  if (!quantityStr || quantityStr === '') return '';
+  var match = String(quantityStr).match(/\d+/);
+  if (match) return parseInt(match[0], 10);
+  return '';
+}
+
+function summarizeQuantities_(qtyArray) {
+  var arr = qtyArray || [];
+  if (arr.length === 0) return { list: '', total: '' };
+  var nums = arr.map(function(q) {
+    var n = parseInt(q, 10);
+    return isNaN(n) ? 1 : n;
+  });
+  return { list: nums.join(', '), total: nums.reduce(function(a, b) { return a + b; }, 0) };
+}
+
+/** F2 FIX: force plain text format before writing quantities */
+function writeQuantityCells_(sheet, row, quantityCol, totalQuantityCol, quantities) {
+  var summary = summarizeQuantities_(quantities);
+  if (quantityCol !== -1) {
+    var qtyCell = sheet.getRange(row, quantityCol);
+    qtyCell.setNumberFormat('@');
+    qtyCell.setValue(summary.list);
+  }
+  if (totalQuantityCol !== -1) {
+    sheet.getRange(row, totalQuantityCol).setValue(summary.total);
+  }
+}
+
+/* ================================================================
+ *  LOOKUP BUILDING (reads Product Short Name sheet ONLY)
+ * ================================================================ */
+
+function buildLookup_() {
+  var empty = { entries: [], exact: {}, shortSet: {}, colorByShort: {}, allShortNames: [] };
+  var sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(LOOKUP_SHEET_NAME);
+  if (!sh) { Logger.log('Lookup sheet not found'); return empty; }
+
+  var dataRange = sh.getDataRange();
+  var values = dataRange.getValues();
+  if (values.length < 2) { Logger.log('Lookup sheet has no data'); return empty; }
+
+  var fontColors = dataRange.getFontColors();
+  var headers = values[0].map(function(h) { return String(h).trim(); });
+  var nameIdx = headers.indexOf(LOOKUP_NAME_HEADER);
+  var shortIdx = headers.indexOf(LOOKUP_SHORT_HEADER);
+  if (nameIdx === -1 || shortIdx === -1) { Logger.log('Missing headers in lookup'); return empty; }
+
+  var entries = [], exact = {}, shortSet = {}, colorByShort = {}, allShortNames = [], seenShort = {};
+
+  for (var i = 1; i < values.length; i++) {
+    var rawName = values[i][nameIdx];
+    var rawShort = values[i][shortIdx];
+    if (!rawName || rawName === '' || !rawShort || rawShort === '') continue;
+
+    var short = String(rawShort).trim();
+    var lowerShort = short.toLowerCase();
+    shortSet[lowerShort] = true;
+
+    if (!seenShort[lowerShort]) {
+      seenShort[lowerShort] = true;
+      allShortNames.push(short);
+      var font = (fontColors && fontColors[i] && fontColors[i][shortIdx])
+        ? fontColors[i][shortIdx] : DEFAULT_FONT_COLOR;
+      colorByShort[lowerShort] = { font: font };
+    }
+
+    var norm = normalizeForMatch_(rawName);
+    if (!norm) continue;
+    var simpleNorm = simplifyProductName_(norm);
+    exact[norm] = short;
+    if (simpleNorm && simpleNorm !== norm) exact[simpleNorm] = short;
+
+    entries.push({
+      norm: norm, simpleNorm: simpleNorm,
+      tokens: tokensOf_(norm), short: short, rawName: rawName
+    });
+  }
+
+  return { entries: entries, exact: exact, shortSet: shortSet,
+           colorByShort: colorByShort, allShortNames: allShortNames };
+}
+
+/* ================================================================
+ *  PRODUCT NAME FUNCTIONS (unchanged)
+ * ================================================================ */
+
+function simplifyProductName_(normStr) {
+  var colorWords = ['black','white','green','red','blue','yellow','golden','emerald','octagon','round','square'];
+  return normStr.split(' ').filter(function(w) {
+    return !colorWords.includes(w) && w.length > 2;
+  }).slice(0, 3).join(' ');
+}
+
+function extractProductAndQuantity(value) {
+  var str = String(value).trim();
+  var quantity = '';
+
+  var leadingMatch = str.match(/^(\d+\s*[*x\u00d7]\s*)/i);
+  if (leadingMatch) {
+    quantity = leadingMatch[1].trim();
+    str = str.substring(leadingMatch[0].length).trim();
+  }
+
+  var trailingMatch = str.match(/\s*([x\u00d7]\s*\d+)\s*$/i);
+  if (trailingMatch) {
+    quantity = trailingMatch[1].trim();
+    str = str.substring(0, str.length - trailingMatch[0].length).trim();
+  }
+
+  var descriptiveWords = '';
+  var parenMatch = str.match(/\(([^)]+)\)/);
+  if (parenMatch && parenMatch[1]) descriptiveWords = parenMatch[1];
+
+  str = str.replace(/\s*\([^)]*\)\s*/g, ' ').replace(/\s+/g, ' ').trim();
+
+  if (descriptiveWords) {
+    descriptiveWords = descriptiveWords.replace(/\b(shape|round|square|octagon|emerald|golden)\b/gi, '').trim();
+    if (descriptiveWords) str = str + ' ' + descriptiveWords;
+  }
+
+  return { productName: str.trim(), quantity: quantity };
+}
+
+function normalizeForMatch_(value) {
+  if (!value) return '';
+  return extractProductAndQuantity(value).productName
+    .toLowerCase().replace(/[^a-z0-9\s]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function tokensOf_(normStr) {
+  return normStr.split(' ').filter(function(w) { return w.length >= 2; });
+}
+
+function matchShortName_(searchTerm, lookup) {
+  var nSearch = normalizeForMatch_(searchTerm);
+  if (!nSearch) return null;
+
+  if (Object.prototype.hasOwnProperty.call(lookup.exact, nSearch)) return lookup.exact[nSearch];
+
+  var searchWords = tokensOf_(nSearch);
+  if (searchWords.length === 0) return null;
+
+  var bestShort = null, bestScore = 0;
+
+  for (var i = 0; i < lookup.entries.length; i++) {
+    var entry = lookup.entries[i];
+    var productWords = entry.tokens;
+    if (productWords.length === 0) continue;
+
+    var matched = 0;
+    for (var s = 0; s < searchWords.length; s++) {
+      var sw = searchWords[s];
+      if (sw.length < 2) continue;
+      var hit = false, bestWordScore = 0;
+
+      for (var p = 0; p < productWords.length; p++) {
+        var pw = productWords[p];
+        if (pw.length < 2) continue;
+        if (pw === sw) { hit = true; bestWordScore = 1.0; break; }
+        if (pw.length >= 3 && sw.length >= 3) {
+          if (pw.indexOf(sw) !== -1 || sw.indexOf(pw) !== -1) {
+            var score = Math.min(pw.length, sw.length) / Math.max(pw.length, sw.length);
+            if (score > bestWordScore) { bestWordScore = score; hit = true; }
+          }
+        }
+      }
+      if (hit) matched++;
+    }
+    if (matched === 0) continue;
+
+    var recall = matched / searchWords.length;
+    var precision = matched / productWords.length;
+    var f1Score = (2 * precision * recall) / (precision + recall);
+    var boost = (matched >= Math.min(searchWords.length, productWords.length) * 0.5) ? 0.2 : 0;
+    var finalScore = f1Score + boost;
+
+    if (finalScore > bestScore) { bestScore = finalScore; bestShort = entry.short; }
+  }
+
+  return bestScore >= MATCH_THRESHOLD ? bestShort : null;
+}
+
+/* ================================================================
+ *  F1: CONTENT-BASED SKIP
+ *  Returns true if the Items cell value needs processing.
+ *  Returns false if empty or already all short names → skip instantly.
+ * ================================================================ */
+
+function needsProcessing_(value, lookup) {
+  if (!value || String(value).trim() === '') return false;
+
+  var parts = String(value).split(/[\n;,]+/).map(function(s) { return s.trim(); }).filter(function(s) { return s; });
+  if (parts.length === 0) return false;
+
+  for (var i = 0; i < parts.length; i++) {
+    if (!lookup.shortSet[parts[i].toLowerCase()]) {
+      return true;   // at least one part is NOT a known short name → needs processing
+    }
+  }
+  return false;  // all parts are already short names → skip
+}
+
+/* ================================================================
+ *  SINGLE ITEM PROCESSING
+ *  Reads Product Short Name sheet via lookup — never old Total Sales rows
+ * ================================================================ */
+
+function processSingleItem_(part, lookup) {
+  if (lookup.shortSet[part.toLowerCase()]) {
+    return { short: part, quantity: '' };
+  }
+
+  var extracted = extractProductAndQuantity(part);
+  var productName = extracted.productName;
+  var qty = extracted.quantity;
+
+  if (!productName || productName.length < 2) return { short: null, quantity: '' };
+
+  var short = matchShortName_(productName, lookup);
+
+  if (!short) {
+    short = generateShortName(productName, lookup.allShortNames || []);
+    addToLookupSheet(productName, short);
+
+    var newLookup = buildLookup_();
+    lookup.entries = newLookup.entries;
+    lookup.exact = newLookup.exact;
+    lookup.shortSet = newLookup.shortSet;
+    lookup.colorByShort = newLookup.colorByShort;
+    lookup.allShortNames = newLookup.allShortNames;
+  }
+
+  if (short) return { short: short, quantity: extractNumericQuantity(qty) };
+  return { short: null, quantity: '' };
+}
+
+/* ================================================================
+ *  WRITE ITEMS TO CELL (sequential with \n line breaks)
+ * ================================================================ */
+
+function processAndWriteItems_(sheet, row, itemsCol, value, lookup) {
+  if (!value) return { allItems: [], quantities: [] };
+
+  var original = String(value);
+  var parts = original.split(/[\n;,]+/).map(function(s) { return s.trim(); }).filter(function(s) { return s; });
+  if (parts.length === 0) return { allItems: [], quantities: [] };
+
+  // Single item
+  if (parts.length === 1) {
+    var result = processSingleItem_(parts[0], lookup);
+    var outputText = result.short || parts[0];
+    var cell = sheet.getRange(row, itemsCol);
+    cell.setValue(outputText);
+    applyItemFormatting_(cell, outputText);
+    return { allItems: [{ shortName: outputText }], quantities: [result.quantity || ''] };
+  }
+
+  // Multiple items — sequential write with \n
+  var allItems = [], quantities = [], cumulativeText = '';
+
+  for (var i = 0; i < parts.length; i++) {
+    var res = processSingleItem_(parts[i], lookup);
+    var outputShort = res.short || parts[i];
+    allItems.push({ shortName: outputShort });
+    quantities.push(res.quantity || '');
+
+    cumulativeText = (i === 0) ? outputShort : cumulativeText + '\n' + outputShort;
+
+    var cell = sheet.getRange(row, itemsCol);
+    cell.setValue(cumulativeText);
+    applyRichTextFormatting_(cell, allItems.map(function(item) { return item.shortName; }));
+
+    if (i < parts.length - 1) {
+      Utilities.sleep(BATCH_ITEM_DELAY);
+      SpreadsheetApp.flush();
+    }
+  }
+
+  // F3: auto-resize row height for multi-line content
+  sheet.autoResizeRows(row, 1);
+
+  return { allItems: allItems, quantities: quantities };
+}
+
+/* ================================================================
+ *  FORMATTING (font 14, bold, color — no background)
+ * ================================================================ */
+
+function applyItemFormatting_(cell, shortName) {
+  cell.setFontSize(14);
+  cell.setFontWeight('bold');
+  cell.setFontColor(getFontColorForText(shortName));
+}
+
+function applyRichTextFormatting_(cell, shortNames) {
+  if (!shortNames || shortNames.length === 0) return;
+
+  var builder = SpreadsheetApp.newRichTextValue();
+  var fullText = '', segments = [];
+
+  shortNames.forEach(function(name, index) {
+    var prefix = (index > 0) ? '\n' : '';
+    var textToAdd = prefix + name;
+    segments.push({ start: fullText.length, end: fullText.length + textToAdd.length,
+                    fontColor: getFontColorForText(name) });
+    fullText += textToAdd;
+  });
+
+  builder.setText(fullText);
+  segments.forEach(function(seg) {
+    builder.setTextStyle(seg.start, seg.end,
+      SpreadsheetApp.newTextStyle()
+        .setForegroundColor(seg.fontColor).setFontSize(14).setBold(true).build()
+    );
+  });
+
+  cell.setRichTextValue(builder.build());
+  cell.setWrap(true);
+}
+
+/* ================================================================
+ *  WRITE GUARD
+ * ================================================================ */
+
+function runGuarded_(writeFn) {
+  CacheService.getScriptCache().put(WRITE_GUARD_KEY, '1', 30);
+  writeFn();
+  SpreadsheetApp.flush();
+}
+
+/* ================================================================
+ *  COLUMN INDEX HELPER (reads Row 1 only)
+ * ================================================================ */
+
+function getColumnIndices_(sheet) {
+  var lastCol = sheet.getLastColumn();
+  if (lastCol < 1) return null;
+  var headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(function(h) { return String(h).trim(); });
+  var itemsIdx = headers.indexOf(ITEMS_HEADER);
+  if (itemsIdx === -1) { Logger.log('ERROR: "' + ITEMS_HEADER + '" header not found'); return null; }
+  return {
+    itemsCol: itemsIdx + 1,
+    quantityCol: headers.indexOf(ITEM_QUANTITY_HEADER) !== -1 ? headers.indexOf(ITEM_QUANTITY_HEADER) + 1 : -1,
+    totalQuantityCol: headers.indexOf(TOTAL_QUANTITY_HEADER) !== -1 ? headers.indexOf(TOTAL_QUANTITY_HEADER) + 1 : -1
+  };
+}
+
+/* ================================================================
+ *  FIND UNCONVERTED ROWS (the core new logic)
+ *
+ *  Batch-reads the entire Items column in ONE API call.
+ *  Checks each value in memory against lookup.shortSet.
+ *  Returns only the row numbers that need processing.
+ *  Old converted rows: never written to, never updated.
+ * ================================================================ */
+
+function findUnconvertedRows_(sheet, cols, lookup) {
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return [];
+
+  // ONE batch read — all Items values at once
+  var allItems = sheet.getRange(2, cols.itemsCol, lastRow - 1, 1).getValues();
+  var unconverted = [];
+
+  for (var i = 0; i < allItems.length; i++) {
+    var value = allItems[i][0];
+    if (needsProcessing_(value, lookup)) {
+      unconverted.push(i + 2);   // row number (1-indexed, skip header)
+    }
+  }
+
+  return unconverted;
+}
+
+/* ================================================================
+ *  PROCESS UNCONVERTED ROWS
+ *  Only touches rows returned by findUnconvertedRows_.
+ *  Old/converted rows are never read individually or written to.
+ * ================================================================ */
+
+function processUnconvertedRows_(sheet, rows, cols, lookup) {
+  var changed = 0;
+
+  Logger.log('Lookup: ' + lookup.entries.length + ' entries, ' + lookup.allShortNames.length + ' short names');
+
+  runGuarded_(function() {
+    for (var idx = 0; idx < rows.length; idx++) {
+      var row = rows[idx];
+      var current = sheet.getRange(row, cols.itemsCol).getValue();
+
+      if (!current || String(current).trim() === '') {
+        Logger.log('Row ' + row + ': empty on re-read — skipping');
+        continue;
+      }
+
+      Logger.log('Row ' + row + ': converting "' + String(current).substring(0, 80) + '"');
+
+      var res = processAndWriteItems_(sheet, row, cols.itemsCol, current, lookup);
+
+      // Refresh lookup for next row (in case new product was added)
+      lookup = buildLookup_();
+
+      if (res.allItems.length > 0) {
+        changed++;
+        writeQuantityCells_(sheet, row, cols.quantityCol, cols.totalQuantityCol, res.quantities);
+        Logger.log('Row ' + row + ': → ' +
+          res.allItems.map(function(item) { return item.shortName; }).join(', '));
+      }
+    }
+  });
+
+  Logger.log('processUnconvertedRows_ done: ' + changed + ' row(s) converted out of ' + rows.length + ' candidates');
+  return changed;
+}
+
+/* ================================================================
+ *  onSourceRowInsert (onChange trigger)
+ *
+ *  1. Wait 2000ms for source to finish writing
+ *  2. Build lookup from Product Short Name sheet
+ *  3. Batch-read Items column, find unconverted rows
+ *  4. Process ONLY those rows
+ *  5. Old converted rows: never touched
+ * ================================================================ */
+
+function onSourceRowInsert(e) {
+  if (CacheService.getScriptCache().get(WRITE_GUARD_KEY)) return;
+
+  var type = (e && e.changeType) ? e.changeType : 'OTHER';
+  if (['FORMAT','REMOVE_ROW','REMOVE_COLUMN','INSERT_COLUMN','REMOVE_GRID'].indexOf(type) !== -1) return;
+
+  // Wait for source to finish writing
+  Utilities.sleep(PROCESSING_DELAY);
+
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SALES_SHEET_NAME);
+  if (!sheet) return;
+
+  var cols = getColumnIndices_(sheet);
+  if (!cols) return;
+
+  var lookup = buildLookup_();
+
+  // Find which rows need processing (batch read, in-memory check)
+  var unconverted = findUnconvertedRows_(sheet, cols, lookup);
+
+  if (unconverted.length === 0) {
+    Logger.log('onChange: no unconverted rows found. Nothing to do.');
+    return;
+  }
+
+  Logger.log('onChange: found ' + unconverted.length + ' unconverted row(s): ' +
+    unconverted.slice(0, 10).join(', ') + (unconverted.length > 10 ? '...' : ''));
+
+  try {
+    processUnconvertedRows_(sheet, unconverted, cols, lookup);
+  } catch (err) {
+    console.error('onChange processing failed: ' + err);
+  }
+}
+
+/* ================================================================
+ *  onEdit (manual edits)
+ * ================================================================ */
+
+function onEdit(e) {
+  if (!e || !e.range) return;
+  var sheet = e.range.getSheet();
+  if (sheet.getName() !== SALES_SHEET_NAME) return;
+  try {
+    Utilities.sleep(1000);
+    fillEditedRows_(sheet, e.range);
+  } catch (err) {
+    console.error('onEdit failed: ' + err);
+  }
+}
+
+function fillEditedRows_(sheet, range) {
+  var cols = getColumnIndices_(sheet);
+  if (!cols) return;
+
+  var startRow = range.getRow();
+  var numRows = range.getNumRows();
+  var numCols = range.getNumColumns();
+
+  if (cols.itemsCol < range.getColumn() || cols.itemsCol > range.getColumn() + numCols - 1) return;
+
+  var lookup = buildLookup_();
+
+  runGuarded_(function() {
+    for (var r = 0; r < numRows; r++) {
+      var row = startRow + r;
+      if (row === 1) continue;
+
+      var current = sheet.getRange(row, cols.itemsCol).getValue();
+      if (!needsProcessing_(current, lookup)) continue;
+
+      var res = processAndWriteItems_(sheet, row, cols.itemsCol, current, lookup);
+      lookup = buildLookup_();
+
+      if (res.allItems.length > 0) {
+        writeQuantityCells_(sheet, row, cols.quantityCol, cols.totalQuantityCol, res.quantities);
+      }
+    }
+  });
+}
+
+/* ================================================================
+ *  TELEGRAM (unchanged)
+ * ================================================================ */
+
+function getTelegramConfigByName(name) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var tgSheet = ss.getSheetByName(TELEGRAM_SHEET_NAME);
+  if (!tgSheet) return null;
+  var data = tgSheet.getDataRange().getValues();
+  for (var i = 0; i < data.length; i++) {
+    var n = data[i][0] ? data[i][0].toString().trim() : '';
+    if (n === name) {
+      var token = data[i][1] ? data[i][1].toString().trim() : '';
+      var chatId = data[i][2] ? data[i][2].toString().trim() : '';
+      if (token && chatId) return { token: token, chatId: chatId };
+    }
+  }
+  return null;
+}
+
+function getAllTelegramContacts() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var tgSheet = ss.getSheetByName(TELEGRAM_SHEET_NAME);
+  if (!tgSheet) return [];
+  var data = tgSheet.getDataRange().getValues();
+  var contacts = [];
+  for (var i = 1; i < data.length; i++) {
+    var name = data[i][0] ? data[i][0].toString().trim() : '';
+    var token = data[i][1] ? data[i][1].toString().trim() : '';
+    var chatId = data[i][2] ? data[i][2].toString().trim() : '';
+    if (name && token && chatId) contacts.push({ name: name, token: token, chatId: chatId });
+  }
+  return contacts;
+}
+
+function sendTelegramMessageWithContact(text, contactName) {
+  var config = getTelegramConfigByName(contactName);
+  if (!config) return false;
+  var url = 'https://api.telegram.org/bot' + config.token + '/sendMessage';
+  try {
+    var response = UrlFetchApp.fetch(url, {
+      'method': 'post', 'contentType': 'application/json', 'muteHttpExceptions': true,
+      'payload': JSON.stringify({ 'chat_id': config.chatId, 'text': text, 'parse_mode': 'Markdown' })
+    });
+    return JSON.parse(response.getContentText()).ok;
+  } catch (error) { console.error('Telegram error: ' + error); return false; }
+}
+
+function onDropdownEdit(e) {
+  if (!e) { SpreadsheetApp.getUi().alert("Don't run this directly."); return; }
+  var sheet = e.range.getSheet();
+  if (sheet.getName() === TELEGRAM_SHEET_NAME || sheet.getName() === LOOKUP_SHEET_NAME) return;
+  handleTelegramSend(e, sheet, e.range);
+}
+
+function handleTelegramSend(e, sheet, range) {
+  var row = range.getRow(), col = range.getColumn(), newValue = e.value;
+  if (row === 1 || !newValue) return;
+
+  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  var actionIdx = headers.indexOf('Action');
+  if (actionIdx === -1 || col !== (actionIdx + 1) || newValue !== 'Send') return;
+
+  var statusIdx = headers.indexOf('Status');
+  var orderIdIdx = headers.indexOf('Order ID');
+  var courierIdIdx = headers.indexOf('Courier ID');
+  var itemsIdx = headers.indexOf(ITEMS_HEADER);
+  var assignedTgIdx = headers.indexOf('Assigned Telegram');
+
+  var required = { 'Order ID': orderIdIdx, 'Courier ID': courierIdIdx,
+    'Items': itemsIdx, 'Assigned Telegram': assignedTgIdx, 'Status': statusIdx, 'Action': actionIdx };
+  var missing = Object.keys(required).filter(function(k) { return required[k] === -1; });
+  if (missing.length > 0) {
+    SpreadsheetApp.getUi().alert("Missing headers:\n" + missing.map(function(h){return "- '"+h+"'";}).join("\n"));
+    return;
+  }
+
+  var statusRange = sheet.getRange(row, statusIdx + 1);
+  if (statusRange.getValue() === 'Sent') {
+    SpreadsheetApp.getUi().alert('Already sent!'); range.setValue(''); return;
+  }
+
+  var rowData = sheet.getRange(row, 1, 1, sheet.getLastColumn()).getValues()[0];
+  var telegramName = rowData[assignedTgIdx];
+  if (!telegramName) { SpreadsheetApp.getUi().alert('Assign a Telegram contact first.'); range.setValue(''); return; }
+
+  var config = getTelegramConfigByName(telegramName);
+  if (!config) { SpreadsheetApp.getUi().alert('Config not found for "' + telegramName + '".'); range.setValue(''); return; }
+
+  var message = '📦 *New Order Notification* \n\n' +
+    '🆔 *Order ID:* ' + (rowData[orderIdIdx] || 'N/A') + '\n' +
+    '🚚 *Courier ID:* ' + (rowData[courierIdIdx] || 'N/A') + '\n' +
+    '🛒 *Items:* ' + (rowData[itemsIdx] || 'N/A');
+
+  if (sendTelegramMessageWithContact(message, telegramName)) {
+    statusRange.setValue('Sent'); statusRange.setBackground('#d9ead3');
+  }
+  range.setValue('');
+}
+
+/* ================================================================
+ *  MENU FUNCTIONS
+ * ================================================================ */
+
+function convertAllItemsManual() {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SALES_SHEET_NAME);
+  if (!sheet) { SpreadsheetApp.getUi().alert('Sheet not found.'); return; }
+
+  var cols = getColumnIndices_(sheet);
+  if (!cols) { SpreadsheetApp.getUi().alert('Items column not found.'); return; }
+
+  var lookup = buildLookup_();
+  var unconverted = findUnconvertedRows_(sheet, cols, lookup);
+
+  if (unconverted.length === 0) {
+    SpreadsheetApp.getUi().alert('All rows are already converted. Nothing to do.');
+    return;
+  }
+
+  var changed = processUnconvertedRows_(sheet, unconverted, cols, lookup);
+  SpreadsheetApp.getUi().alert('Done. Converted ' + changed + ' row(s) out of ' + unconverted.length + ' found.');
+}
+
+function diagnosePipeline() {
+  var ui = SpreadsheetApp.getUi();
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SALES_SHEET_NAME);
+  if (!sheet) { ui.alert('Sheet not found.'); return; }
+
+  var cols = getColumnIndices_(sheet);
+  var lookup = buildLookup_();
+  var unconverted = cols ? findUnconvertedRows_(sheet, cols, lookup) : [];
+  var lastRow = sheet.getLastRow();
+
+  var sampleInfo = '(none)';
+  if (unconverted.length > 0) {
+    var firstRow = unconverted[0];
+    var val = sheet.getRange(firstRow, cols.itemsCol).getValue();
+    var extracted = extractProductAndQuantity(String(val).split(/[\n;,]/)[0].trim());
+    var matched = matchShortName_(extracted.productName, lookup);
+    sampleInfo = 'Row ' + firstRow + ': "' + String(val).substring(0, 60) + '"\n' +
+      '   Product: "' + extracted.productName + '"\n' +
+      '   Match: ' + (matched ? '"' + matched + '" ✅' : 'NO MATCH (will auto-generate)');
+  }
+
+  var report =
+    '🔍 PIPELINE DIAGNOSTIC\n' +
+    '═'.repeat(50) + '\n\n' +
+    '📋 Product Short Name sheet:\n' +
+    '   Entries: ' + lookup.entries.length + '\n' +
+    '   Status: ' + (lookup.entries.length > 0 ? '✅ OK' : '❌ EMPTY!') + '\n\n' +
+    '📊 Total Sales:\n' +
+    '   Last row (getLastRow): ' + lastRow + '\n' +
+    '   Items col: ' + (cols ? '✅ col ' + cols.itemsCol : '❌ NOT FOUND') + '\n' +
+    '   Unconverted rows found: ' + unconverted.length + '\n' +
+    (unconverted.length > 0
+      ? '   Rows: ' + unconverted.slice(0, 15).join(', ') + (unconverted.length > 15 ? '...' : '') + '\n'
+      : '') + '\n' +
+    '🧪 First unconverted sample:\n   ' + sampleInfo + '\n\n' +
+    '═'.repeat(50) + '\n' +
+    '💡 Use "Convert All Items" to process unconverted rows.';
+
+  ui.alert('Diagnostic', report, ui.ButtonSet.OK);
+}
+
+function testSingleRow() {
+  var ui = SpreadsheetApp.getUi();
+  var response = ui.prompt('Test Single Row', 'Enter row number (e.g. 84):', ui.ButtonSet.OK_CANCEL);
+  if (response.getSelectedButton() !== ui.Button.OK) return;
+
+  var rowNum = parseInt(response.getResponseText(), 10);
+  if (isNaN(rowNum) || rowNum < 2) { ui.alert('Invalid row. Must be >= 2.'); return; }
+
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SALES_SHEET_NAME);
+  if (!sheet) { ui.alert('Sheet not found.'); return; }
+
+  var cols = getColumnIndices_(sheet);
+  if (!cols) { ui.alert('Items column not found.'); return; }
+
+  var current = sheet.getRange(rowNum, cols.itemsCol).getValue();
+  if (!current || String(current).trim() === '') {
+    ui.alert('Row ' + rowNum + ': Items cell is empty.'); return;
+  }
+
+  var lookup = buildLookup_();
+  var res = processAndWriteItems_(sheet, rowNum, cols.itemsCol, current, lookup);
+
+  if (res.allItems.length > 0) {
+    writeQuantityCells_(sheet, rowNum, cols.quantityCol, cols.totalQuantityCol, res.quantities);
+  }
+
+  var summary = summarizeQuantities_(res.quantities);
+  ui.alert('✅ Row ' + rowNum + ' processed!\n\n' +
+    'Items: ' + res.allItems.map(function(i) { return i.shortName; }).join(', ') + '\n' +
+    'Quantities: ' + summary.list + '\n' +
+    'Total: ' + summary.total);
+}
+
+function testMatching() {
+  var ui = SpreadsheetApp.getUi();
+  var lookup = buildLookup_();
+  if (lookup.entries.length === 0) { ui.alert('No entries in Product Short Name sheet.'); return; }
+
+  var tests = [
+    'Marble Kitchen Piri - Emerald Green Octagon Shape x1',
+    'Granite Kitchen Piri – Black Round Shape x2',
+    'Marble Kitchen Piri/Chakla (White Round) x7',
+    'Marble Chopping Board- White × 2, Marble Chopping Board- Forest Green × 1, Marble Kitchen Piri (Round shape black) × 3'
+  ];
+
+  var results = '🧪 MATCHING TEST\n' + '═'.repeat(50) + '\n\n';
+  tests.forEach(function(test, idx) {
+    var extracted = extractProductAndQuantity(test);
+    var short = matchShortName_(extracted.productName, lookup);
+    var generated = false;
+    if (!short) { short = generateShortName(extracted.productName, lookup.allShortNames); generated = true; }
+    var qty = extractNumericQuantity(extracted.quantity);
+    results += 'Test ' + (idx+1) + ': "' + test.substring(0, 60) + '"\n';
+    results += '  → "' + short + '"' + (generated ? ' (NEW)' : '') + '  qty=' + (qty || '1') + '\n\n';
+  });
+
+  ui.alert('Results', results, ui.ButtonSet.OK);
+}
+
+function testTelegramContacts() {
+  var contacts = getAllTelegramContacts();
+  Logger.log('Telegram contacts: ' + contacts.length);
+  contacts.forEach(function(c) {
+    Logger.log('  ' + c.name + ' -> ' + c.token.substring(0, 10) + '...');
+  });
+}
+
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu('Sales Tools')
+    .addItem('🔄 Convert All Items', 'convertAllItemsManual')
+    .addSeparator()
+    .addItem('🔍 Diagnose Pipeline', 'diagnosePipeline')
+    .addItem('🧪 Test Single Row', 'testSingleRow')
+    .addItem('🧪 Test Matching', 'testMatching')
+    .addSeparator()
+    .addItem('Test Telegram Contacts', 'testTelegramContacts')
+    .addToUi();
+}
